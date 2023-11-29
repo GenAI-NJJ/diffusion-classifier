@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=1; python eval_prob_adaptive.py \
+  --version 1-4 \
+  --img_size 256 \
+  --batch_size 128 \
+  --dataset cifar10 \
+  --split test \
+  --n_trials 1 \
+  --to_keep 5 1 \
+  --n_samples 50 500 \
+  --loss l2 \
+  --noise_path noise_1024_32.pt \
+  --prompt_path prompts/cifar10_prompts.csv
