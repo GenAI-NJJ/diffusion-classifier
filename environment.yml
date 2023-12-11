@@ -1,4 +1,4 @@
-name: diffusion-classifier
+name: diffc2
 channels:
   - pytorch
   - nvidia

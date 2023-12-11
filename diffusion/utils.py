@@ -6,7 +6,9 @@ import os.path as osp
 import torch
 from PIL import Image
 
-DATASET_ROOT = os.getenv('DATASET_ROOT', '/datasets')
+# DATASET_ROOT = os.getenv('DATASET_ROOT', '/131_data/namgi/data')
+# LOG_DIR = os.getenv('LOG_DIR', '/131_data/namgi/logs/diff_classifier')
+DATASET_ROOT = os.getenv('DATASET_ROOT', '/data/namgi')
 LOG_DIR = os.getenv('LOG_DIR', 'data')
 TOKEN_PATH = os.getenv('TOKEN_PATH', osp.expanduser('~/hf_token.txt'))
 HDD_ROOT = os.getenv('HDD_ROOT', '')  # should point to the HDD path on each machine
