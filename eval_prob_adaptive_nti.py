@@ -125,7 +125,7 @@ class NullInversion:
         all_latent = [latent]
         latent = latent.clone().detach()
         for i in range(NUM_DDIM_STEPS):
-            t = self.scheduler.timesteps[len(self.model.scheduler.timesteps) - i - 1]
+            t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 1]
             noise_pred = self.get_noise_pred_single(latent, t, cond_embeddings)
             latent = self.next_step(noise_pred, t, latent)
             all_latent.append(latent)
@@ -135,7 +135,7 @@ class NullInversion:
         uncond_embeddings, cond_embeddings = self.context.chunk(2)
         uncond_embeddings_list = []
         latent_cur = latents[-1]
-        bar = tqdm(total=num_inner_steps * NUM_DDIM_STEPS)
+        bar = tqdm.tqdm(total=num_inner_steps * NUM_DDIM_STEPS)
         for i in range(NUM_DDIM_STEPS):
             uncond_embeddings = uncond_embeddings.clone().detach()
             uncond_embeddings.requires_grad = True
@@ -165,28 +165,37 @@ class NullInversion:
         bar.close()
         return uncond_embeddings_list
 
-    def integrate_errors(self, ddim_latents, text_embeddings):
-        uncond_embeddings, cond_embeddings = self.context.chunk(2)
+    def integrate_errors(self, uncond_embeddings, ddim_latents, text_embeddings):
         errors_list = []
         num_classes = len(text_embeddings[:-2])
         for i in range(NUM_DDIM_STEPS):
-            uncond_embeddings = uncond_embeddings.clone().detach()
             latent_prev = ddim_latents[len(ddim_latents) - i - 2]
             t = self.scheduler.timesteps[i]
+            # print(uncond_embeddings.shape, text_embeddings.shape)
             context = torch.cat([uncond_embeddings[i], text_embeddings[:-2]])
             latents_input = ddim_latents[len(ddim_latents) - i - 1].repeat(num_classes+1, 1, 1, 1)
             
+            # print(latents_input.shape, context.shape)
+            
             guidance_scale = GUIDANCE_SCALE
             noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-            noise_pred_uncond, noise_prediction_text = noise_pred.chunk((1, num_classes))
+            noise_pred_uncond, noise_prediction_text = noise_pred.split((1, num_classes))
+            
+            # print(noise_pred_uncond.shape, noise_prediction_text.shape)
+
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
             latents = self.prev_step(noise_pred, t, latents_input[:num_classes])
-            loss = F.mse_loss(latents, latent_prev.repeat(num_classes, 1, 1, 1))
+            loss = F.mse_loss(latents.detach(), latent_prev.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            
+            # print(loss.shape)
+            
             errors_list.append(loss)
         return errors_list
     
     def classify(self, errors_list):
-        return torch.argmin(torch.stack(errors_list), dim=0)
+        errors = torch.stack(errors_list).mean(dim=0)
+        print(errors.shape)
+        return torch.argmin(errors).cpu().item()
     
     def invert(self, latent, text_embeddings: list, offsets=(0,0,0,0), num_inner_steps=10, early_stop_epsilon=1e-5):
         self.init_prompt(text_embeddings)
@@ -276,121 +285,13 @@ def register_attention_control(unet, controller):
     controller.num_att_layers = cross_att_count
 
 
-def eval_prob_adaptive(unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
-    scheduler_config = get_scheduler_config(args)
-    T = scheduler_config['num_train_timesteps']
-    max_n_samples = max(args.n_samples)
-
-    if all_noise is None:
-        all_noise = torch.randn((max_n_samples * args.n_trials, 4, latent_size, latent_size), device=latent.device)
-    if args.dtype == 'float16':
-        all_noise = all_noise.half()
-        scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
-
-    data = dict()
-    t_evaluated = set()
-    remaining_prmpt_idxs = list(range(len(text_embeds)))
-    start = T // max_n_samples // 2
-    t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
-
-    for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
-        ts = []
-        noise_idxs = []
-        text_embed_idxs = []
-        curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
-        curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
-        for prompt_i in remaining_prmpt_idxs:
-            for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
-                ts.extend([t] * args.n_trials)
-                noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
-                text_embed_idxs.extend([prompt_i] * args.n_trials)
-        t_evaluated.update(curr_t_to_eval)
-        pred_errors = eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                 text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
-        # match up computed errors to the data
-        for prompt_i in remaining_prmpt_idxs:
-            mask = torch.tensor(text_embed_idxs) == prompt_i
-            prompt_ts = torch.tensor(ts)[mask]
-            prompt_pred_errors = pred_errors[mask]
-            if prompt_i not in data:
-                data[prompt_i] = dict(t=prompt_ts, pred_errors=prompt_pred_errors)
-            else:
-                data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
-                data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
-
-        # compute the next remaining idxs
-        errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
-        best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
-        remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
-
-    # organize the output
-    assert len(remaining_prmpt_idxs) == 1
-    pred_idx = remaining_prmpt_idxs[0]
-
-    return pred_idx, data
-
-
-def eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-               text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
-    assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
-    pred_errors = torch.zeros(len(ts), device='cpu')
-    idx = 0
-    with torch.inference_mode():
-        for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
-            batch_ts = torch.tensor(ts[idx: idx + batch_size])
-            noise = all_noise[noise_idxs[idx: idx + batch_size]]
-            noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(device) + \
-                            noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(device)
-            t_input = batch_ts.to(device).half() if dtype == 'float16' else batch_ts.to(device)
-            text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
-            noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
-            if loss == 'l2':
-                error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'l1':
-                error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'huber':
-                error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            else:
-                raise NotImplementedError
-            pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
-            idx += len(batch_ts)
-    return pred_errors
-
-
-def eval_prob_adaptive_nti(unet, latent, text_embeddings, scheduler, inverter, args, latent_size=64, all_noise=None):
+def eval_prob_adaptive_nti(unet, latent, text_embeddings, scheduler, inverter: NullInversion, args, latent_size=64, all_noise=None):
     
     ddim_latents, uncond_embeddings = inverter.invert(latent, text_embeddings, num_inner_steps=10)
-    errors_list = inverter.integrate_errors(ddim_latents, text_embeddings)
+    errors_list = inverter.integrate_errors(uncond_embeddings, ddim_latents, text_embeddings)
     pred_idx = inverter.classify(errors_list)
 
     return pred_idx, errors_list
-
-
-def eval_error_cfg(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                   text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
-    assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
-    pred_errors = torch.zeros(len(ts), device='cpu')
-    idx = 0
-    with torch.inference_mode():
-        for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
-            batch_ts = torch.tensor(ts[idx: idx + batch_size])
-            noise = all_noise[noise_idxs[idx: idx + batch_size]]
-            noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(device) + \
-                            noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(device)
-            t_input = batch_ts.to(device).half() if dtype == 'float16' else batch_ts.to(device)
-            text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
-            noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
-            if loss == 'l2':
-                error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'l1':
-                error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'huber':
-                error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            else:
-                raise NotImplementedError
-            pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
-            idx += len(batch_ts)
-    return pred_errors
 
 
 def main():
@@ -423,8 +324,12 @@ def main():
     parser.add_argument('--to_keep', nargs='+', type=int, required=True)
     parser.add_argument('--n_samples', nargs='+', type=int, required=True)
 
+    # optional arg for using DDIM
+    parser.add_argument('--scheduler', type=str, choices=['EDM', 'DDIM'], default='DDIM')
+
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
+    
 
     # make run output folder
     name = f"v{args.version}_{args.n_trials}trials_"
@@ -463,7 +368,6 @@ def main():
 
     # load noise
     if args.noise_path is not None:
-        assert not args.zero_noise
         all_noise = torch.load(args.noise_path).to(device)
         print('Loaded noise from', args.noise_path)
     else:

@@ -1,6 +1,6 @@
 import torch
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline, \
-    EulerDiscreteScheduler
+    EulerDiscreteScheduler, DDIMScheduler, DDPMScheduler
 
 MODEL_IDS = {
     '1-1': "CompVis/stable-diffusion-v1-1",
@@ -30,6 +30,8 @@ def get_sd_model(args):
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
     unet = pipe.unet
+    if args.scheduler == 'DDIM':
+        scheduler = DDIMScheduler.from_config(scheduler.config)
     return vae, tokenizer, text_encoder, unet, scheduler
 
 
