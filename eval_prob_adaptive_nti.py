@@ -10,6 +10,7 @@ import tqdm
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from torch.optim.adam import Adam
+from torch.optim.sgd import SGD
 from PIL import Image
 import ptp_utils
 
@@ -116,6 +117,9 @@ class NullInversion:
     @torch.no_grad()
     def init_prompt(self, text_embeddings):
         uncond_embeddings = text_embeddings[-1:].detach().clone()
+        
+        print('INIT_PROMPT: nan in uncond_embeddings', torch.isnan(uncond_embeddings).any())
+        
         text_embeddings = text_embeddings[-2:-1].detach().clone()
         self.context = torch.cat([uncond_embeddings, text_embeddings])
 
@@ -139,12 +143,17 @@ class NullInversion:
         for i in range(NUM_DDIM_STEPS):
             uncond_embeddings = uncond_embeddings.clone().detach()
             uncond_embeddings.requires_grad = True
-            optimizer = Adam([uncond_embeddings], lr=1e-2 * (1. - i / 100.))
+            # optimizer = Adam([uncond_embeddings], lr=1e-2 * (1. - i / 100.))
+            optimizer = SGD([uncond_embeddings], lr=1e-2 * (1. - i / 100.))
             latent_prev = latents[len(latents) - i - 2]
             t = self.scheduler.timesteps[i]
             with torch.no_grad():
                 noise_pred_cond = self.get_noise_pred_single(latent_cur, t, cond_embeddings)
             for j in range(num_inner_steps):
+                if torch.isnan(uncond_embeddings).any():
+                    
+                    print('NULL_OPTIMIZATION - INNERSTEP: nan in uncond_embeddings -step', i, 'innerstep', j)
+                
                 noise_pred_uncond = self.get_noise_pred_single(latent_cur, t, uncond_embeddings)
                 noise_pred = noise_pred_uncond + GUIDANCE_SCALE * (noise_pred_cond - noise_pred_uncond)
                 latents_prev_rec = self.prev_step(noise_pred, t, latent_cur)
@@ -158,6 +167,9 @@ class NullInversion:
                     break
             for j in range(j + 1, num_inner_steps):
                 bar.update()
+                
+            # print('NULL_OPTIMIZATION: nan in uncond_embeddings -step', i, torch.isnan(uncond_embeddings).any())
+            
             uncond_embeddings_list.append(uncond_embeddings[:1].detach())
             with torch.no_grad():
                 context = torch.cat([uncond_embeddings, cond_embeddings])
@@ -172,8 +184,13 @@ class NullInversion:
             latent_prev = ddim_latents[len(ddim_latents) - i - 2]
             t = self.scheduler.timesteps[i]
             # print(uncond_embeddings.shape, text_embeddings.shape)
+            
+            # print('INTI_ERRORS: nan in uncond_embeddings', torch.isnan(uncond_embeddings[i]).any())
+            # print('nan in text_embeddings', torch.isnan(text_embeddings).any())
+            # print('nan in ddim_latents', torch.isnan(ddim_latents[i]).any())
+            
             context = torch.cat([uncond_embeddings[i], text_embeddings[:-2]])
-            latents_input = ddim_latents[len(ddim_latents) - i - 1].repeat(num_classes+1, 1, 1, 1)
+            latents_input = ddim_latents[len(ddim_latents)-i-1].repeat(num_classes+1, 1, 1, 1)
             
             # print(latents_input.shape, context.shape)
             
@@ -182,19 +199,24 @@ class NullInversion:
             noise_pred_uncond, noise_prediction_text = noise_pred.split((1, num_classes))
             
             # print(noise_pred_uncond.shape, noise_prediction_text.shape)
+            # print('nan in noise_pred_uncond', torch.isnan(noise_pred_uncond).any())
+            # print('nan in noise_prediction_text', torch.isnan(noise_prediction_text).any())
 
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
-            latents = self.prev_step(noise_pred, t, latents_input[:num_classes])
+            latents = self.prev_step(noise_pred, t, ddim_latents[len(ddim_latents)-i-1].repeat(num_classes, 1, 1, 1))
+            
+            # print('nan in latents', torch.isnan(latents).any())
+            
             loss = F.mse_loss(latents.detach(), latent_prev.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
             
             # print(loss.shape)
+            # print('nan in loss', torch.isnan(loss).any())
             
             errors_list.append(loss)
         return errors_list
     
     def classify(self, errors_list):
         errors = torch.stack(errors_list).mean(dim=0)
-        print(errors.shape)
         return torch.argmin(errors).cpu().item()
     
     def invert(self, latent, text_embeddings: list, offsets=(0,0,0,0), num_inner_steps=10, early_stop_epsilon=1e-5):
@@ -290,8 +312,10 @@ def eval_prob_adaptive_nti(unet, latent, text_embeddings, scheduler, inverter: N
     ddim_latents, uncond_embeddings = inverter.invert(latent, text_embeddings, num_inner_steps=10)
     errors_list = inverter.integrate_errors(uncond_embeddings, ddim_latents, text_embeddings)
     pred_idx = inverter.classify(errors_list)
+    errors = torch.stack(errors_list).mean(dim=0)
+    print(pred_idx, errors)
 
-    return pred_idx, errors_list
+    return pred_idx, errors
 
 
 def main():
@@ -376,7 +400,10 @@ def main():
     # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
     # prompts = prompts_df.prompt.tolist()
     
-    text_input = tokenizer(prompts_df.prompt.tolist(), padding="max_length",
+    prompts = prompts_df.prompt.tolist()
+    prompts[-1] = ""
+    
+    text_input = tokenizer(prompts, padding="max_length",
                            max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
     embeddings = []
     with torch.inference_mode():
@@ -419,6 +446,9 @@ def main():
             x0 *= 0.18215
         pred_idx, pred_errors = eval_prob_adaptive_nti(unet, x0, text_embeddings, scheduler, inverter, args, latent_size, all_noise)
         pred = prompts_df.classidx[pred_idx]
+        
+        print(f'Label: {label}, Pred: {pred}')
+        
         torch.save(dict(errors=pred_errors, pred=pred, label=label), fname)
         if pred == label:
             correct += 1
