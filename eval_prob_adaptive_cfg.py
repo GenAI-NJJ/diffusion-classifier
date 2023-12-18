@@ -198,7 +198,7 @@ def eval_prob_adaptive_cfg(unet, latent, text_embeds, scheduler, args, latent_si
         remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
 
     # organize the output
-    assert len(remaining_prmpt_idxs) == 1
+    assert len(remaining_prmpt_idxs) == 1, f'{remaining_prmpt_idxs}'
     pred_idx = remaining_prmpt_idxs[0]
 
     return pred_idx, data
@@ -258,7 +258,10 @@ def main():
     
     # cfg hyperparams
     parser.add_argument('--alpha', type=float, default=1.0, help='weight of cond error for cfg')
-    parser.add_argument('--beta', type=float, default=1.0, help='weight of uncond error for cfg')
+    parser.add_argument('--beta', type=float, default=0.0, help='weight of uncond error for cfg')
+
+    # optional arg for using DDIM
+    parser.add_argument('--scheduler', type=str, choices=['EDM', 'DDIM'], default='EDM')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)

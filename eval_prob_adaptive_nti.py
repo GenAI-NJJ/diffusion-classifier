@@ -19,7 +19,7 @@ from diffusion.models import get_sd_model, get_scheduler_config
 from diffusion.utils import LOG_DIR, get_formatstr
 
 
-device = "cuda:3" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -27,9 +27,9 @@ INTERPOLATIONS = {
     'lanczos': InterpolationMode.LANCZOS,
 }
 LOW_RESOURCE = False 
-NUM_DDIM_STEPS = 10
+NUM_DDIM_STEPS = 5
 # GUIDANCE_SCALE = 7.5
-GUIDANCE_SCALE = 1.
+GUIDANCE_SCALE = .5
 MAX_NUM_WORDS = 77
 
 def _convert_image_to_rgb(image):
@@ -184,21 +184,19 @@ class NullInversion:
         errors_list = []
         num_classes = len(text_embeddings[:-2])
         for i in range(NUM_DDIM_STEPS):
-            latent_prev = ddim_latents[len(ddim_latents) - i - 2]
             t = self.scheduler.timesteps[i]
             
-            context = torch.cat([uncond_embeddings[i], text_embeddings[:-1]])
-            latents_input = ddim_latents[len(ddim_latents)-i-1].repeat(num_classes+2, 1, 1, 1)
+            context = torch.cat([uncond_embeddings[i], text_embeddings[:-2]])
+            latents_input = ddim_latents[len(ddim_latents)-i-1].repeat(num_classes+1, 1, 1, 1)
             
             guidance_scale = GUIDANCE_SCALE
             noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-            noise_pred_uncond, noise_prediction_text, noise_prediction_base = noise_pred.split((1, num_classes, 1))
+            noise_pred_uncond, noise_prediction_text = noise_pred.split((1, num_classes))
 
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
             latents = self.prev_step(noise_pred, t, ddim_latents[len(ddim_latents)-i-1].repeat(num_classes, 1, 1, 1))
-            latents_base = self.prev_step(noise_prediction_base, t, ddim_latents[len(ddim_latents)-i-1].repeat(1, 1, 1, 1))
             
-            loss = F.mse_loss(latents.detach(), latents_base.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            loss = F.mse_loss(latents.detach(), ddim_latents[len(ddim_latents) - i - 2].repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
             
             errors_list.append(loss)
         
