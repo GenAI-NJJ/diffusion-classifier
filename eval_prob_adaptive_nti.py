@@ -19,7 +19,7 @@ from diffusion.models import get_sd_model, get_scheduler_config
 from diffusion.utils import LOG_DIR, get_formatstr
 
 
-device = "cuda:1" if torch.cuda.is_available() else "cpu"
+device = "cuda:3" if torch.cuda.is_available() else "cpu"
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -27,8 +27,9 @@ INTERPOLATIONS = {
     'lanczos': InterpolationMode.LANCZOS,
 }
 LOW_RESOURCE = False 
-NUM_DDIM_STEPS = 50
-GUIDANCE_SCALE = 7.5
+NUM_DDIM_STEPS = 10
+# GUIDANCE_SCALE = 7.5
+GUIDANCE_SCALE = 1.
 MAX_NUM_WORDS = 77
 
 def _convert_image_to_rgb(image):
@@ -118,7 +119,7 @@ class NullInversion:
     def init_prompt(self, text_embeddings):
         uncond_embeddings = text_embeddings[-1:].detach().clone()
         
-        print('INIT_PROMPT: nan in uncond_embeddings', torch.isnan(uncond_embeddings).any())
+        # print('INIT_PROMPT: nan in uncond_embeddings', torch.isnan(uncond_embeddings).any())
         
         text_embeddings = text_embeddings[-2:-1].detach().clone()
         self.context = torch.cat([uncond_embeddings, text_embeddings])
@@ -150,8 +151,8 @@ class NullInversion:
             with torch.no_grad():
                 noise_pred_cond = self.get_noise_pred_single(latent_cur, t, cond_embeddings)
             for j in range(num_inner_steps):
+                
                 if torch.isnan(uncond_embeddings).any():
-                    
                     print('NULL_OPTIMIZATION - INNERSTEP: nan in uncond_embeddings -step', i, 'innerstep', j)
                 
                 noise_pred_uncond = self.get_noise_pred_single(latent_cur, t, uncond_embeddings)
@@ -162,6 +163,7 @@ class NullInversion:
                 loss.backward()
                 optimizer.step()
                 loss_item = loss.item()
+                bar.set_description(f'ddim: {i+1}/{NUM_DDIM_STEPS} - loss: {loss_item:.4f}')
                 bar.update()
                 if loss_item < epsilon + i * 2e-5:
                     break
@@ -177,11 +179,45 @@ class NullInversion:
         bar.close()
         return uncond_embeddings_list
 
+    @torch.no_grad()
     def integrate_errors(self, uncond_embeddings, ddim_latents, text_embeddings):
         errors_list = []
         num_classes = len(text_embeddings[:-2])
         for i in range(NUM_DDIM_STEPS):
             latent_prev = ddim_latents[len(ddim_latents) - i - 2]
+            t = self.scheduler.timesteps[i]
+            
+            context = torch.cat([uncond_embeddings[i], text_embeddings[:-1]])
+            latents_input = ddim_latents[len(ddim_latents)-i-1].repeat(num_classes+2, 1, 1, 1)
+            
+            guidance_scale = GUIDANCE_SCALE
+            noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
+            noise_pred_uncond, noise_prediction_text, noise_prediction_base = noise_pred.split((1, num_classes, 1))
+
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+            latents = self.prev_step(noise_pred, t, ddim_latents[len(ddim_latents)-i-1].repeat(num_classes, 1, 1, 1))
+            latents_base = self.prev_step(noise_prediction_base, t, ddim_latents[len(ddim_latents)-i-1].repeat(1, 1, 1, 1))
+            
+            loss = F.mse_loss(latents.detach(), latents_base.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            
+            errors_list.append(loss)
+        
+        errors = torch.stack(errors_list).argmin(dim=1).cpu().long()
+        print(errors)
+        pred_idx = torch.mode(errors).values.item()
+    
+        return pred_idx, errors_list
+
+    @torch.no_grad()
+    def integrate_errors_final(self, uncond_embeddings, ddim_latents, text_embeddings):
+        errors_list = []
+        errors_list2 = []
+        errors_list3 = []
+        num_classes = len(text_embeddings[:-2])
+            
+        prev_latents = ddim_latents[-1].repeat(num_classes+1, 1, 1, 1)
+        
+        for i in range(NUM_DDIM_STEPS):
             t = self.scheduler.timesteps[i]
             # print(uncond_embeddings.shape, text_embeddings.shape)
             
@@ -189,35 +225,56 @@ class NullInversion:
             # print('nan in text_embeddings', torch.isnan(text_embeddings).any())
             # print('nan in ddim_latents', torch.isnan(ddim_latents[i]).any())
             
-            context = torch.cat([uncond_embeddings[i], text_embeddings[:-2]])
-            latents_input = ddim_latents[len(ddim_latents)-i-1].repeat(num_classes+1, 1, 1, 1)
-            
-            # print(latents_input.shape, context.shape)
+            uncond_context = uncond_embeddings[i].repeat(num_classes+1, 1, 1)
+            cond_context = text_embeddings[:-1].detach().clone()
             
             guidance_scale = GUIDANCE_SCALE
-            noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-            noise_pred_uncond, noise_prediction_text = noise_pred.split((1, num_classes))
             
-            # print(noise_pred_uncond.shape, noise_prediction_text.shape)
-            # print('nan in noise_pred_uncond', torch.isnan(noise_pred_uncond).any())
-            # print('nan in noise_prediction_text', torch.isnan(noise_prediction_text).any())
-
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
-            latents = self.prev_step(noise_pred, t, ddim_latents[len(ddim_latents)-i-1].repeat(num_classes, 1, 1, 1))
+            # print(prev_latents.shape, t, uncond_context.shape, cond_context.shape)
             
-            # print('nan in latents', torch.isnan(latents).any())
+            noise_pred_uncond = self.unet(prev_latents, t, encoder_hidden_states=uncond_context)["sample"]
+            noise_pred_uncond = noise_pred_uncond.detach().cpu()
             
-            loss = F.mse_loss(latents.detach(), latent_prev.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            # print(noise_pred_uncond.shape)
             
-            # print(loss.shape)
-            # print('nan in loss', torch.isnan(loss).any())
+            noise_pred_cond = self.unet(prev_latents, t, encoder_hidden_states=cond_context)["sample"]
+            noise_pred_cond = noise_pred_cond.detach().cpu()
+            
+            # print(noise_pred_cond.shape)
+            
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            noise_pred = noise_pred.to(device)
+            
+            latents = self.prev_step(noise_pred, t, prev_latents)
+            prev_latents = latents.clone().detach()
+            latents_cond, latents_base = latents.split((num_classes, 1))
+            
+            loss = F.mse_loss(latents_cond.detach(), latents_base.repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            loss2 = F.mse_loss(latents_cond.detach(), ddim_latents[len(ddim_latents)-i-2].repeat(num_classes, 1, 1, 1).detach(), reduction='none').mean(dim=(1, 2, 3))
+            
+            # print(F.mse_loss(latents_base.detach(), ddim_latents[len(ddim_latents)-i-2].detach()))
             
             errors_list.append(loss)
-        return errors_list
+            errors_list2.append(loss2)
+            
+        print(torch.stack(errors_list).argmin(dim=1).cpu().long())
+        print(torch.stack(errors_list2).argmin(dim=1).cpu().long())
+        errors = torch.stack(errors_list).mean(dim=0)
+        pred_idx = torch.argmin(errors).cpu().item()
+        
+        errors2 = torch.stack(errors_list2).mean(dim=0)
+        pred_idx2 = int(torch.stack(errors_list2).argmin(dim=1)[-1])
+        
+        print(pred_idx, pred_idx2)
+    
+        return pred_idx2, errors_list2
     
     def classify(self, errors_list):
-        errors = torch.stack(errors_list).mean(dim=0)
-        return torch.argmin(errors).cpu().item()
+        # errors = torch.stack(errors_list).mean(dim=0)
+        # return torch.argmin(errors).cpu().item()
+        errors = torch.stack(errors_list).argmin(dim=1).cpu().long()
+        print(errors)
+        return torch.mode(errors).values.item()
     
     def invert(self, latent, text_embeddings: list, offsets=(0,0,0,0), num_inner_steps=10, early_stop_epsilon=1e-5):
         self.init_prompt(text_embeddings)
@@ -309,11 +366,12 @@ def register_attention_control(unet, controller):
 
 def eval_prob_adaptive_nti(unet, latent, text_embeddings, scheduler, inverter: NullInversion, args, latent_size=64, all_noise=None):
     
-    ddim_latents, uncond_embeddings = inverter.invert(latent, text_embeddings, num_inner_steps=10)
-    errors_list = inverter.integrate_errors(uncond_embeddings, ddim_latents, text_embeddings)
-    pred_idx = inverter.classify(errors_list)
+    ddim_latents, uncond_embeddings = inverter.invert(latent, text_embeddings, num_inner_steps=5)
+    # pred_idx, errors_list = inverter.integrate_errors(uncond_embeddings, ddim_latents, text_embeddings)
+    pred_idx, errors_list = inverter.integrate_errors_final(uncond_embeddings, ddim_latents, text_embeddings)
+    
     errors = torch.stack(errors_list).mean(dim=0)
-    print(pred_idx, errors)
+    # print(pred_idx, errors)
 
     return pred_idx, errors
 
@@ -453,6 +511,8 @@ def main():
         if pred == label:
             correct += 1
         total += 1
+        
+        print(f'Acc: {100 * correct / total:.2f}%')
 
 
 if __name__ == '__main__':
